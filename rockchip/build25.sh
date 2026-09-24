@@ -1,4 +1,27 @@
 #!/bin/bash
+# ════════════════════════════════════════════════════════════════════════════
+#  rockchip/build25.sh（R1 Plus 定制版）
+#  改造自 wukongdaily/ImmortalWrt-ImageBuilder 的同名文件
+#
+#  ★ 与上游的差异只有一处：删掉了「生成 pppoe-settings」那一段 ★
+#
+#    上游会把 $PPPOE_ACCOUNT / $PPPOE_PASSWORD 【明文】写进
+#        files/etc/config/pppoe-settings
+#    再由首启脚本读出来写进 network.wan.username/password。
+#    问题是这个文件被烤进镜像，而镜像会发到公开 Release 里 ——
+#    等于把宽带账号密码挂到网上供任意下载。
+#
+#    本版本不再生成该文件。PPPoE 请刷完后在 LuCI「网络 → 接口 → WAN」
+#    里手填，或者在设备上执行（凭据留在设备上，不进镜像）：
+#        uci set network.wan.proto='pppoe'
+#        uci set network.wan.username='你的账号'
+#        uci set network.wan.password='你的密码'
+#        uci set network.wan6.proto='none'
+#        uci commit network && /etc/init.d/network restart
+#
+#    ⚠️ 将来若从上游重新同步这个文件，这段改动会被覆盖 —— 记得重新删一次。
+# ════════════════════════════════════════════════════════════════════════════
+
 # Log file for debugging
 source shell/apk-custom-packages.sh
 echo "第三方APK软件包: $CUSTOM_PACKAGES"
@@ -9,18 +32,7 @@ echo "Building for profile: $PROFILE"
 # yml 传入的固件大小 ROOTFS_PARTSIZE
 echo "Building for ROOTFS_PARTSIZE: $ROOTFS_PARTSIZE"
 
-echo "Create pppoe-settings"
-mkdir -p  /home/build/immortalwrt/files/etc/config
-
-# 创建pppoe配置文件 yml传入环境变量ENABLE_PPPOE等 写入配置文件 供99-custom.sh读取
-cat << EOF > /home/build/immortalwrt/files/etc/config/pppoe-settings
-enable_pppoe=${ENABLE_PPPOE}
-pppoe_account=${PPPOE_ACCOUNT}
-pppoe_password=${PPPOE_PASSWORD}
-EOF
-
-echo "cat pppoe-settings"
-cat /home/build/immortalwrt/files/etc/config/pppoe-settings
+# ── 上游在此处生成 pppoe-settings，本版本已移除（原因见文件头） ──
 
 if [ -z "$CUSTOM_PACKAGES" ]; then
   echo "⚪️ 未选择 任何第三方软件包"

@@ -1,0 +1,295 @@
+name: Build R1 Plus | ImmortalWrt 25.12.x
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Orange Pi R1 Plus 定制固件构建
+#  改造自 wukongdaily/ImmortalWrt-ImageBuilder 的 build-rockchip-25.12.x.yml
+#
+#  与上游的差异（每一条都是刻意的，改回去之前先读完理由）：
+#
+#  ① 去掉了 PPPoE 三个输入项
+#     上游 rockchip/build25.sh 会把宽带账号/密码【明文】写进固件
+#     /etc/config/pppoe-settings，而产物是发到公开 Release 的 ——
+#     等于把宽带凭据随镜像一起挂到网上。本工作流不再接受凭据，
+#     PPPoE 刷完在 LuCI「网络→接口→WAN」里手填（两下的事）。
+#
+#  ② docker 的包名写进 shell/apk-custom-packages.sh
+#     上游这个步骤误写进 shell/custom-packages.sh，而 build25.sh
+#     只 source 了 apk-custom-packages.sh —— 所以上游勾选 docker
+#     其实不生效（docker 引擎装不进去）。这里修掉了。
+#
+#  ③ chmod 的是 rockchip/build25.sh（上游写的是 build24.sh，无害但是错的）
+#
+#  ④ 新增构建后 manifest 断言：管理页必需包缺一个就直接 fail，
+#     防止产出「能开机、能发 IP，但 80 端口没人监听」的固件
+#
+#  ⑤ 新增 extra_packages 输入，默认已填好复刻现网所需的一套
+#
+#  ⑥ root 密码【不预置】，与上游一致（出厂 root 无密码）。
+#     刷完请立刻去 LuCI「系统 → 管理权」设一个 —— 设之前，任何能连上
+#     LAN 的人都能直接登 root。外网进不来，因为 WAN 入站已被 99-fix.sh
+#     收回 REJECT（上游默认是 ACCEPT，那才是真正危险的组合）。
+#
+#  ⚠️ 还有一个不在本文件里的改动：files/etc/uci-defaults/99-fix.sh
+#     它把上游 99-custom.sh 硬编码的 WAN 入站 ACCEPT 收回到 REJECT，
+#     并清理 PPPoE 凭据残留。少了它，固件出厂 WAN 就是全开的。
+# ════════════════════════════════════════════════════════════════════════════
+
+on:
+  workflow_dispatch:
+    inputs:
+      luci_version:
+        description: "luci / 内核版本（决定拉哪个 ImageBuilder 镜像）"
+        required: false
+        default: "25.12.2"
+        type: choice
+        options:
+          - 25.12.0
+          - 25.12.1
+          - 25.12.2
+
+      profile:
+        description: "设备型号（R1 Plus 非 LTS；LTS 版网卡是 yt8531c，别选错）"
+        required: true
+        type: choice
+        default: "xunlong_orangepi-r1-plus"
+        options:
+          - xunlong_orangepi-r1-plus
+          - xunlong_orangepi-r1-plus-lts
+          - friendlyarm_nanopi-r2s
+          - friendlyarm_nanopi-r2c
+          - friendlyarm_nanopi-r2c-plus
+          - friendlyarm_nanopi-r3s
+          - friendlyarm_nanopi-r4s
+          - friendlyarm_nanopi-r4se
+          - friendlyarm_nanopi-r5c
+          - friendlyarm_nanopi-r5s
+          - friendlyarm_nanopi-r6c
+          - friendlyarm_nanopi-r6s
+          - firefly_roc-rk3328-cc
+          - lunzn_fastrhino-r66s
+          - lunzn_fastrhino-r68s
+          - radxa_e25
+          - radxa_rock-3a
+          - radxa_rock-3b
+          - radxa_rock-3c
+          - radxa_rock-5a
+          - radxa_rock-5b
+          - radxa_rock-pi-4a
+          - radxa_zero-3e
+          - radxa_zero-3w
+          - xunlong_orangepi-5
+          - xunlong_orangepi-5-plus
+        # 需要别的机型：去上游 .github/workflows/build-rockchip-25.12.x.yml
+        # 把 profile options 整段复制过来即可，其余不用动。
+
+      custom_router_ip:
+        description: "后台管理地址（只对多网口机型有效。用你现网同网段，否则刷完进不去后台）"
+        required: true
+        default: "10.0.0.1"
+
+      rootfs_partsize:
+        description: "rootfs 分区大小（SD 卡 8G 选 2G；64G 卡选 4G，剩余空间另建数据分区）"
+        required: true
+        type: choice
+        default: "4G"
+        options:
+          - "1G"
+          - "2G"
+          - "3G"
+          - "4G"
+
+      enable_store:
+        description: "集成 iStore 商店（luci-app-store）"
+        required: false
+        type: boolean
+        default: true
+
+      include_docker:
+        description: "集成 Docker（1GB 内存跑 docker 偏紧，不需要就选 no）"
+        required: true
+        type: choice
+        default: "yes"
+        options:
+          - "yes"
+          - "no"
+
+      extra_packages:
+        description: "额外软件包，空格分隔。默认值=复刻现网那套；包名写错构建会失败"
+        required: false
+        default: "luci-i18n-quickstart-zh-cn luci-i18n-nikki-zh-cn luci-app-samba4 luci-i18n-samba4-zh-cn luci-i18n-wol-zh-cn luci-i18n-upnp-zh-cn"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      # 上游这里是 build24.sh，是错的（本工作流挂在 build25.sh 上）
+      - name: Set executable permissions
+        run: chmod +x "${{ github.workspace }}/rockchip/build25.sh"
+
+      - name: Save custom router IP
+        run: |
+          mkdir -p "${{ github.workspace }}/custom"
+          echo "${{ inputs.custom_router_ip }}" > "${{ github.workspace }}/custom/custom_router_ip.txt"
+          echo "后台地址将设为: ${{ inputs.custom_router_ip }}"
+          # 该文件会被挂载到固件 /etc/config/custom_router_ip.txt，
+          # 由首启脚本 files/etc/uci-defaults/99-custom.sh 读取并写入 network.lan.ipaddr
+
+      - name: Preflight - 检查必需文件都在
+        run: |
+          WARNFILE="${{ github.workspace }}/files/etc/uci-defaults/99-fix.sh"
+          if [ -f "$WARNFILE" ]; then
+            echo "✅ 找到 99-fix.sh（WAN 入站收回 + 凭据清理）"
+          else
+            echo "❌ 缺少 files/etc/uci-defaults/99-fix.sh"
+            echo "   没有它，固件出厂的 WAN 入站就是 ACCEPT（全部服务暴露到公网 IPv6）。"
+            exit 1
+          fi
+          grep -q "input='REJECT'" "$WARNFILE" \
+            && echo "✅ 99-fix.sh 里确认有 REJECT 逻辑" \
+            || { echo "❌ 99-fix.sh 里没有 REJECT 逻辑，停止构建"; exit 1; }
+
+      - name: Enable Store integration
+        run: |
+          if [ "${{ inputs.enable_store }}" == "true" ]; then
+            echo 'CUSTOM_PACKAGES="$CUSTOM_PACKAGES luci-app-store"' >> shell/apk-custom-packages.sh
+            echo "✅ 已追加 luci-app-store（商店本体由 wukongdaily/apk 的 .run 提供）"
+          else
+            echo "❎ 未启用商店"
+          fi
+
+      # ⚠️ 上游这里写的是 shell/custom-packages.sh —— 那是 24.10(opkg) 的文件，
+      #    build25.sh 根本不 source 它，所以勾选 docker 会静默失效。这里修正。
+      - name: Check Docker
+        run: |
+          if [ "${{ inputs.include_docker }}" == "yes" ]; then
+            echo 'CUSTOM_PACKAGES="$CUSTOM_PACKAGES docker"' >> shell/apk-custom-packages.sh
+            echo "✅ 已追加 docker（写入 apk-custom-packages.sh，build25.sh 会 source 它）"
+          else
+            echo "❎ 未启用 docker"
+          fi
+
+      - name: 追加用户自定义包
+        run: |
+          EXTRA="${{ inputs.extra_packages }}"
+          EXTRA=$(echo "$EXTRA" | tr -s ' ')
+          if [ -n "$EXTRA" ]; then
+            echo "CUSTOM_PACKAGES=\"\$CUSTOM_PACKAGES $EXTRA\"" >> shell/apk-custom-packages.sh
+            echo "✅ 已追加自定义包："
+            echo "$EXTRA" | tr ' ' '\n' | sed 's/^/  - /'
+          else
+            echo "⚪️ 未指定额外包"
+          fi
+
+      - name: 显示最终包清单
+        run: |
+          echo "===== shell/apk-custom-packages.sh 生效行（非注释）====="
+          grep -vE '^\s*#' shell/apk-custom-packages.sh | grep -v '^\s*$' || true
+
+      - name: Building Rockchip ImmortalWrt 25.12.x
+        run: |
+          profile="${{ inputs.profile }}"
+          include_docker="${{ inputs.include_docker }}"
+          rootfs_partsize="${{ inputs.rootfs_partsize }}"
+          case "$rootfs_partsize" in
+            1G) ROOTFS_SIZE=1024 ;;
+            2G) ROOTFS_SIZE=2048 ;;
+            3G) ROOTFS_SIZE=3072 ;;
+            4G) ROOTFS_SIZE=4096 ;;
+          esac
+          echo "ROOTFS_SIZE=$ROOTFS_SIZE" >> $GITHUB_ENV
+          luci_version="${{ inputs.luci_version }}"
+          echo "profile=$profile  rootfs=${ROOTFS_SIZE}MB  luci=$luci_version"
+
+          docker run --rm -i \
+              --user root \
+              -v "${{ github.workspace }}/bin:/home/build/immortalwrt/bin" \
+              -v "${{ github.workspace }}/files:/home/build/immortalwrt/files" \
+              -v "${{ github.workspace }}/custom:/home/build/immortalwrt/files/etc/config" \
+              -v "${{ github.workspace }}/arch/arch.conf:/home/build/immortalwrt/files/etc/opkg/arch.conf" \
+              -v "${{ github.workspace }}/rockchip/imm25.config:/home/build/immortalwrt/.config" \
+              -v "${{ github.workspace }}/shell:/home/build/immortalwrt/shell" \
+              -v "${{ github.workspace }}/rockchip/build25.sh:/home/build/immortalwrt/build.sh" \
+              -e PROFILE=$profile \
+              -e INCLUDE_DOCKER=$include_docker \
+              -e ROOTFS_PARTSIZE=$ROOTFS_SIZE \
+          immortalwrt/imagebuilder:rockchip-armv8-openwrt-${luci_version} /bin/bash /home/build/immortalwrt/build.sh
+
+      - name: Create info
+        run: |
+          cat > "${{ github.workspace }}/router-info.md" <<EOF
+          ## 📡 路由器后台信息
+
+          - ✳️ **设备型号**: ${{ inputs.profile }}
+          - 🏠 **后台地址**: ${{ inputs.custom_router_ip }}
+          - 👤 **用户名**: root
+          - 🔑 **密码**: 无（出厂空密码，刷完请立刻到「系统 → 管理权」设置）
+          - 🧱 **luci / 内核**: ${{ inputs.luci_version }}
+          - 💾 **rootfs 分区**: ${{ inputs.rootfs_partsize }}
+
+          #### 出厂安全设置
+
+          - WAN 入站 = **REJECT**（由 99-fix.sh 收回，上游默认是 ACCEPT）
+          - 固件内**不含** PPPoE 凭据（本工作流已移除该输入项）
+          - root 密码**未预置**（与上游一致）。⚠️ 设密码之前，任何能连上 LAN 的人都可直接登 root
+          EOF
+
+      - name: 校验产物存在
+        run: |
+          BIN="${{ github.workspace }}/bin/targets/rockchip/armv8"
+          ls -lh "$BIN"/*.img.gz || { echo "❌ 没生成 img.gz"; exit 1; }
+
+      - name: 断言管理页必需包（缺一个就失败）
+        run: |
+          # ─────────────────────────────────────────────────────────
+          # 这道网拦的是：固件能开机、能发 IP，但 80 端口没人监听，
+          # 打不开后台 —— 而构建流程一路绿灯不报错，刷完卡才发现。
+          # ─────────────────────────────────────────────────────────
+          MAN=$(ls "${{ github.workspace }}"/bin/targets/rockchip/armv8/*.manifest 2>/dev/null | head -1)
+          [ -z "$MAN" ] && { echo "❌ 找不到 manifest"; exit 1; }
+          echo "核对：$MAN   （包总数 $(wc -l < "$MAN")）"
+
+          NEED="uhttpd luci luci-mod-admin-full luci-mod-network luci-mod-system luci-mod-status luci-app-firewall luci-app-package-manager"
+          if [ "${{ inputs.include_docker }}" = "yes" ]; then NEED="$NEED dockerd"; fi
+          if [ "${{ inputs.enable_store }}" = "true" ]; then NEED="$NEED luci-app-store"; fi
+
+          MISSING=""
+          for p in $NEED; do
+            if grep -q "^$p " "$MAN"; then echo "  ✅ $p"; else echo "  ❌ $p 缺失"; MISSING="$MISSING $p"; fi
+          done
+          if [ -n "$MISSING" ]; then
+            echo ""
+            echo "❌ 固件缺少必需包：$MISSING"
+            echo "   这样的固件能开机、能发 IP，但进不去后台。"
+            echo "   多半是 PACKAGES= 里某个包名不存在，把 IB 的默认包集顶掉了 —— 看上面构建日志里的 (no such package)。"
+            exit 1
+          fi
+          echo ""
+          echo "✅ 必需包齐全"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: imm-r1plus-25.12-${{ github.run_number }}
+          path: ${{ github.workspace }}/bin/targets/rockchip/armv8/*.img.gz
+          retention-days: 30
+
+      - name: Publish to release
+        uses: softprops/action-gh-release@v3
+        with:
+          # 固定用 Autobuild 这个 tag：好处是【旧镜像不会被删】，
+          # 你之前那个 24.10.6 的回滚镜像会一直留在同一个 Release 里。
+          tag_name: Autobuild
+          name: ImmortWrt-Rockchip
+          body_path: ${{ github.workspace }}/router-info.md
+          files: |
+            ${{ github.workspace }}/bin/targets/rockchip/armv8/*.img.gz
+          token: ${{ secrets.GITHUB_TOKEN }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
