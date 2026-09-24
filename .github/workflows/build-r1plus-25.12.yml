@@ -154,6 +154,13 @@ jobs:
           grep -q "input='REJECT'" "$WARNFILE" \
             && echo "✅ 99-fix.sh 里确认有 REJECT 逻辑" \
             || { echo "❌ 99-fix.sh 里没有 REJECT 逻辑，停止构建"; exit 1; }
+          MENUFILE="${{ github.workspace }}/files/usr/share/luci/menu.d/zz-docker-top.json"
+          if [ -f "$MENUFILE" ]; then
+            echo "✅ 找到 zz-docker-top.json（Docker 顶层菜单入口）"
+          else
+            echo "⚠️ 未找到 files/usr/share/luci/menu.d/zz-docker-top.json"
+            echo "   Docker 面板只会出现在「服务 → Dockerman JS」下。不致命，继续构建。"
+          fi
 
       - name: Enable Store integration
         run: |
