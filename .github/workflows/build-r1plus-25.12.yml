@@ -114,9 +114,9 @@ on:
           - "no"
 
       extra_packages:
-        description: "额外软件包，空格分隔。默认值=复刻现网那套；包名写错构建会失败"
+        description: "额外软件包，空格分隔。默认值=你确认过的那套（samba4 + upnp）；包名写错构建会失败"
         required: false
-        default: "luci-i18n-quickstart-zh-cn luci-i18n-nikki-zh-cn luci-app-samba4 luci-i18n-samba4-zh-cn luci-i18n-wol-zh-cn luci-i18n-upnp-zh-cn"
+        default: "luci-i18n-quickstart-zh-cn luci-i18n-nikki-zh-cn luci-app-samba4 luci-i18n-samba4-zh-cn luci-i18n-upnp-zh-cn"
 
 permissions:
   contents: write
