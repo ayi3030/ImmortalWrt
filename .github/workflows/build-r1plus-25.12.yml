@@ -154,12 +154,23 @@ jobs:
           grep -q "input='REJECT'" "$WARNFILE" \
             && echo "✅ 99-fix.sh 里确认有 REJECT 逻辑" \
             || { echo "❌ 99-fix.sh 里没有 REJECT 逻辑，停止构建"; exit 1; }
-          MENUFILE="${{ github.workspace }}/files/usr/share/luci/menu.d/zz-docker-top.json"
-          if [ -f "$MENUFILE" ]; then
-            echo "✅ 找到 zz-docker-top.json（Docker 顶层菜单入口）"
+          # Docker 顶层单入口：两个覆盖文件必须成对出现、且前缀一致，
+          # 否则会出现「菜单点得进去、页面内链接 404」
+          MJSON="${{ github.workspace }}/files/usr/share/luci/menu.d/luci-app-dockerman.json"
+          MJS="${{ github.workspace }}/files/www/luci-static/resources/dockerman/common.js"
+          if [ -f "$MJSON" ] && [ -f "$MJS" ]; then
+            if grep -q "admin/docker" "$MJSON" && grep -q "admin/docker" "$MJS"; then
+              echo "✅ Docker 顶层单入口就位（菜单键与链接前缀均为 admin/docker）"
+            else
+              echo "⚠️ 两个覆盖文件在，但前缀不一致 —— 页面内链接会 404，按手册 §2 重新生成"
+            fi
+            echo "   菜单键引用 admin/docker : $(grep -c 'admin/docker' "$MJSON") 处"
+            echo "   链接前缀 admin/docker   : $(grep -c 'admin/docker' "$MJS") 处"
           else
-            echo "⚠️ 未找到 files/usr/share/luci/menu.d/zz-docker-top.json"
-            echo "   Docker 面板只会出现在「服务 → Dockerman JS」下。不致命，继续构建。"
+            echo "⚠️ 未找到 Docker 顶层入口覆盖文件，Docker 面板会退回「服务 → Dockerman JS」"
+            echo "   缺少：$MJSON"
+            echo "   或：  $MJS"
+            echo "   不致命，继续构建。"
           fi
 
       - name: Enable Store integration
