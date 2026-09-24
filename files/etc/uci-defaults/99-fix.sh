@@ -49,9 +49,17 @@ uci commit firewall
 #    理论上够安全；这里再收一道，属于纵深防御。
 # ─────────────────────────────────────────────────────────────
 if uci -q get ttyd.@ttyd[0] >/dev/null 2>&1; then
-    uci set ttyd.@ttyd[0].interface='lan'
+    # ⚠️ 必须写 '@lan'（带 @），绝不能写裸 'lan'。
+    #    /etc/init.d/ttyd 里只有 @ 开头才会解析成真实设备名：
+    #        [ "${interface::1}" = @ ] && network_get_device device "${interface:1}"
+    #    '@lan' → br-lan；裸 'lan' 会被原样传给 ttyd 的 -i 参数，
+    #    而 ttyd 的 --interface 要的是网络设备名，找不到就
+    #    "Interface lan not found" 直接退出 —— 服务起不来、7681 全不通。
+    #    （2026-09-25 首次刷机实测踩到）
+    uci set ttyd.@ttyd[0].interface='@lan'
     uci commit ttyd
-    echo "  [2] ttyd 限制为 lan" >> "$LOGFILE"
+    /etc/init.d/ttyd restart >/dev/null 2>&1
+    echo "  [2] ttyd 限制为 lan（@lan → br-lan）" >> "$LOGFILE"
 else
     echo "  [2] 未安装 ttyd，跳过" >> "$LOGFILE"
 fi
