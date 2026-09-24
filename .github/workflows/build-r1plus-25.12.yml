@@ -29,9 +29,25 @@ name: Build R1 Plus | ImmortalWrt 25.12.x
 #     LAN 的人都能直接登 root。外网进不来，因为 WAN 入站已被 99-fix.sh
 #     收回 REJECT（上游默认是 ACCEPT，那才是真正危险的组合）。
 #
-#  ⚠️ 还有一个不在本文件里的改动：files/etc/uci-defaults/99-fix.sh
-#     它把上游 99-custom.sh 硬编码的 WAN 入站 ACCEPT 收回到 REJECT，
-#     并清理 PPPoE 凭据残留。少了它，固件出厂 WAN 就是全开的。
+#  ⑦ Docker 菜单【不搬】—— 用 luci-app-dockerman 包自带的位置。
+#     2026-09-25 曾把菜单从「服务 → Dockerman JS」搬到顶层 admin/docker，
+#     离线等价性验证全绿，但同版本 LuCI 重刷时静态资源 ?v= 不变，
+#     用户浏览器继续用缓存的旧 common.js → 点卡片硬 404。
+#     现已撤销：不再覆盖包内的 menu.d/luci-app-dockerman.json 与
+#     www/luci-static/resources/dockerman/common.js。
+#     （以后若真要顶层入口，先读完 操作手册.md §7.7 再动手。）
+#
+#  ⑧ 静态资源版本号带构建后缀（缓存根治）。
+#     覆盖 files/usr/share/ucode/luci/version.uc，构建时把 revision
+#     追加成 '…-r1plus.<run_number>'，让每次构建的资源 URL 都不同，
+#     从此不可能命中旧缓存。
+#
+#  ⚠️ 还有两个不在本文件里的改动：
+#     · files/etc/uci-defaults/99-fix.sh —— 把上游 99-custom.sh 硬编码的
+#       WAN 入站 ACCEPT 收回 REJECT、修 ttyd 接口、放宽 rpcd/uhttpd 超时、
+#       清 PPPoE 凭据残留。少了它，固件出厂 WAN 就是全开的，
+#       而且 LuCI 里拉镜像必然超时失败。
+#     · files/usr/share/ucode/luci/version.uc —— 见上面 ⑧。
 # ════════════════════════════════════════════════════════════════════════════
 
 on:
@@ -154,24 +170,43 @@ jobs:
           grep -q "input='REJECT'" "$WARNFILE" \
             && echo "✅ 99-fix.sh 里确认有 REJECT 逻辑" \
             || { echo "❌ 99-fix.sh 里没有 REJECT 逻辑，停止构建"; exit 1; }
-          # Docker 顶层单入口：两个覆盖文件必须成对出现、且前缀一致，
-          # 否则会出现「菜单点得进去、页面内链接 404」
-          MJSON="${{ github.workspace }}/files/usr/share/luci/menu.d/luci-app-dockerman.json"
-          MJS="${{ github.workspace }}/files/www/luci-static/resources/dockerman/common.js"
-          if [ -f "$MJSON" ] && [ -f "$MJS" ]; then
-            if grep -q "admin/docker" "$MJSON" && grep -q "admin/docker" "$MJS"; then
-              echo "✅ Docker 顶层单入口就位（菜单键与链接前缀均为 admin/docker）"
-            else
-              echo "⚠️ 两个覆盖文件在，但前缀不一致 —— 页面内链接会 404，按手册 §2 重新生成"
+          # ── Docker 菜单：用包自带的原生位置（「服务 → Dockerman JS」）────────
+          # 2026-09-25 决策：撤销「把菜单搬到顶层 admin/docker」的改造。
+          # 那份改造的离线等价性验证是全绿的，问题出在浏览器侧：同一 LuCI 版本
+          # 下静态资源的 ?v= 不变（uhttpd 对 /luci-static/* 不发 Cache-Control，
+          # 浏览器启发式缓存约 1.9 天不回源），用户浏览器会继续用旧的 common.js
+          # —— 里面写着 admin/docker —— 于是点卡片得到硬 404。
+          # 详见 操作手册.md §7.7。这里断言这两个覆盖文件确实【不存在】，
+          # 防止以后误把旧产物拿回来（只放一半 = 菜单与链接前缀不一致）。
+          for F in "${{ github.workspace }}/files/usr/share/luci/menu.d/luci-app-dockerman.json" \
+                   "${{ github.workspace }}/files/www/luci-static/resources/dockerman/common.js"; do
+            if [ -f "$F" ]; then
+              echo "❌ 发现 dockerman 覆盖文件：$F"
+              echo "   它与「Docker 用包自带菜单」的决策冲突，请先 git rm 再构建。"
+              exit 1
             fi
-            echo "   菜单键引用 admin/docker : $(grep -c 'admin/docker' "$MJSON") 处"
-            echo "   链接前缀 admin/docker   : $(grep -c 'admin/docker' "$MJS") 处"
-          else
-            echo "⚠️ 未找到 Docker 顶层入口覆盖文件，Docker 面板会退回「服务 → Dockerman JS」"
-            echo "   缺少：$MJSON"
-            echo "   或：  $MJS"
-            echo "   不致命，继续构建。"
-          fi
+          done
+          echo "✅ Docker 菜单使用包自带定义（admin/services/dockerman，落在「服务」下）"
+
+      - name: 静态资源缓存根治 - 给 luci 版本号追加构建后缀
+        run: |
+          # ── 为什么必须做 ─────────────────────────────────────────────
+          # L.resource() 生成的 URL 形如 /luci-static/xxx.js?v=<luci 版本号>，
+          # 而 uhttpd 对 /luci-static/* 只发 ETag/Last-Modified，
+          # 不发 Cache-Control/Expires → 浏览器走启发式缓存
+          # （有效期 ≈ (现在 − Last-Modified) × 10%，实测约 1.9 天，
+          #   这段时间里根本不回源，ETag 变了也没用）。
+          # 同版本 LuCI 重刷固件时 ?v= 完全不变 → 用户浏览器继续用旧 JS。
+          # 给 revision 追加「每次构建都不同」的后缀即可根除；
+          # 代价只是页脚版本号多一段 -r1plus.N。
+          VU="${{ github.workspace }}/files/usr/share/ucode/luci/version.uc"
+          [ -f "$VU" ] || { echo "❌ 缺少 $VU"; exit 1; }
+          echo "改前：$(cat "$VU")"
+          sed -i "s/\(revision = '\)\([^']*\)'/\1\2-r1plus.${{ github.run_number }}'/" "$VU"
+          echo "改后：$(cat "$VU")"
+          grep -q -- "-r1plus.${{ github.run_number }}" "$VU" \
+            && echo "✅ 资源版本号已带构建后缀（本次 run #${{ github.run_number }}）" \
+            || { echo "❌ 后缀注入失败"; exit 1; }
 
       - name: Enable Store integration
         run: |
@@ -250,12 +285,22 @@ jobs:
           - 🔑 **密码**: 无（出厂空密码，刷完请立刻到「系统 → 管理权」设置）
           - 🧱 **luci / 内核**: ${{ inputs.luci_version }}
           - 💾 **rootfs 分区**: ${{ inputs.rootfs_partsize }}
+          - 🐳 **Docker 面板**: 「服务 → Dockerman JS」（luci-app-dockerman 包的原生位置，未做菜单搬迁）
 
           #### 出厂安全设置
 
           - WAN 入站 = **REJECT**（由 99-fix.sh 收回，上游默认是 ACCEPT）
           - 固件内**不含** PPPoE 凭据（本工作流已移除该输入项）
           - root 密码**未预置**（与上游一致）。⚠️ 设密码之前，任何能连上 LAN 的人都可直接登 root
+
+          #### 本版修掉的已知问题（由 99-fix.sh 与 files/ 落地）
+
+          - 网页终端 ttyd 不监听 7681（接口必须写 `@lan`，裸 `lan` 会让它起不来）
+          - LuCI 里「拉取镜像」必失败（rpcd 单次调用 30s 硬超时 → 放宽到 300s）
+          - 点 Docker 子页面卡片蹦 404（同版本 LuCI 下静态资源 `?v=` 不变 →
+            浏览器一直用旧 JS；现已让每次构建的 `?v=` 都不同）
+          - 首页 quickstart 的「Docker高级配置」按钮 404（上游按 iStoreOS 约定
+            写死了 `admin/docker/overview`，已就地改指 `admin/services/dockerman/overview`）
           EOF
 
       - name: 校验产物存在

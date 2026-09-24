@@ -82,5 +82,58 @@ uci set system.@system[0].zonename='Asia/Shanghai'
 uci commit system
 echo "  [4] 时区 -> Asia/Shanghai" >> "$LOGFILE"
 
+# ─────────────────────────────────────────────────────────────
+# 5) 放宽 rpcd / uhttpd 超时 —— 不放开的话，LuCI 里拉镜像必失败
+#
+#    dockerman 的「拉取镜像」不是走 docker CLI，而是走 ubus RPC
+#    （前端 common.js 里 rpc.declare({object:'docker.image', method:'create'})
+#      → 后端 /usr/share/rpcd/ucode/docker_rpc.uc → POST /images/create）。
+#    rpcd 默认把单次 ubus 调用掐在 30 秒（/etc/config/rpcd 的 timeout）。
+#    稍大的镜像拉取必然 >30s → 前端收到超时错误 → 用户看到"拉取失败"，
+#    而 docker daemon 其实还在后台拉（实测：报超时后镜像仍出现在列表里）。
+#    接着用户去「创建容器」，镜像下拉框里没有目标镜像 → 保存必 400，
+#    报 "no command specified" —— 这就是"创建容器不行"的真实成因链。
+#
+#    2026-09-25 实测数据：CLI 拉 alpine(13.6MB) 14s；走 ubus 拉
+#    nginx:alpine(93MB) 20.7s；python:3.12-alpine 在 30s 上限下被掐断，
+#    放开到 300s 后正常完成。
+#    uhttpd 的 -t（script_timeout，默认 60s）是这条链上更外层的一道，
+#    它比 rpcd 大，所以真正的瓶颈是 rpcd 的 30s；两者一并放宽到 300s。
+# ─────────────────────────────────────────────────────────────
+if uci -q get rpcd.@rpcd[0] >/dev/null 2>&1; then
+    uci set rpcd.@rpcd[0].timeout='300'
+    uci commit rpcd
+fi
+if uci -q get uhttpd.main >/dev/null 2>&1; then
+    uci set uhttpd.main.script_timeout='300'
+    uci commit uhttpd
+fi
+/etc/init.d/rpcd restart >/dev/null 2>&1
+/etc/init.d/uhttpd restart >/dev/null 2>&1
+echo "  [5] rpcd.timeout / uhttpd.script_timeout -> 300s（否则 LuCI 拉镜像超时）" >> "$LOGFILE"
+
+# ─────────────────────────────────────────────────────────────
+# 6) 修 quickstart 首页里那个写死的 Docker 链接
+#
+#    luci-app-quickstart（0.12.7-r1，来自 nas_luci feed）的首页有一张
+#    「Docker高级配置」卡片，href 硬编码成
+#        /cgi-bin/luci/admin/docker/overview
+#    —— 那是 iStoreOS 的约定（iStoreOS 的 dockerman 就挂在顶层 admin/docker）。
+#    而 ImmortalWrt 25.12 的 luci-app-dockerman（JS 重写版）把菜单放在
+#    「服务 → Dockerman JS」，即 admin/services/dockerman 下。
+#    → 照原生菜单跑，这个按钮必然 404（实测 2026-09-25）。
+#
+#    为什么用 sed 就地改、而不是 files/ 覆盖：
+#    index.js 是 498KB 的 Vue 编译产物，放进 git 等于把上游文件冻结；
+#    改一处 URL 用 sed 更轻，而且上游哪天改对了（grep 不到）会自动跳过。
+# ─────────────────────────────────────────────────────────────
+QS=/www/luci-static/quickstart/index.js
+if [ -f "$QS" ] && grep -q '/cgi-bin/luci/admin/docker/overview' "$QS"; then
+    sed -i 's#/cgi-bin/luci/admin/docker/overview#/cgi-bin/luci/admin/services/dockerman/overview#g' "$QS"
+    echo "  [6] quickstart 首页 Docker 链接 -> admin/services/dockerman/overview" >> "$LOGFILE"
+else
+    echo "  [6] quickstart 无该链接或未安装，跳过" >> "$LOGFILE"
+fi
+
 echo "===== 99-fix.sh done =====" >> "$LOGFILE"
 exit 0
