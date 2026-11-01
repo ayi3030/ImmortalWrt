@@ -113,6 +113,23 @@ fi
 echo "  [5] rpcd.timeout / uhttpd.script_timeout -> 300s（否则 LuCI 拉镜像超时）" >> "$LOGFILE"
 
 # ─────────────────────────────────────────────────────────────
+# 6) 软件 flow offloading —— 千兆转发的前提
+#    RK3328 是四核 A53，NAT 全走 CPU 时 PPPoE 千兆压力很大。
+#    flowtable 让已建立连接在 netfilter 层直接转发，不过完整协议栈。
+#    flow_offloading_hw 必须为 0：RK3328 的 GMAC 没有硬件卸载能力，
+#    开着会让规则装不上（2026-11 实测：hw=1 时 OFFLOAD 连接数恒为 0，
+#    改 0 后立刻有 80 条连接走 flowtable）。
+# ─────────────────────────────────────────────────────────────
+if uci -q get firewall.@defaults[0] >/dev/null 2>&1; then
+    uci set firewall.@defaults[0].flow_offloading='1'
+    uci set firewall.@defaults[0].flow_offloading_hw='0'
+    uci commit firewall
+    echo "  [6] flow_offloading=1 / flow_offloading_hw=0（千兆转发前提）" >> "$LOGFILE"
+else
+    echo "  [6] 未找到 firewall defaults，跳过" >> "$LOGFILE"
+fi
+
+# ─────────────────────────────────────────────────────────────
 # 6) 修 quickstart 首页里那个写死的 Docker 链接
 #
 #    luci-app-quickstart（0.12.7-r1，来自 nas_luci feed）的首页有一张
@@ -130,9 +147,9 @@ echo "  [5] rpcd.timeout / uhttpd.script_timeout -> 300s（否则 LuCI 拉镜像
 QS=/www/luci-static/quickstart/index.js
 if [ -f "$QS" ] && grep -q '/cgi-bin/luci/admin/docker/overview' "$QS"; then
     sed -i 's#/cgi-bin/luci/admin/docker/overview#/cgi-bin/luci/admin/services/dockerman/overview#g' "$QS"
-    echo "  [6] quickstart 首页 Docker 链接 -> admin/services/dockerman/overview" >> "$LOGFILE"
+    echo "  [7] quickstart 首页 Docker 链接 -> admin/services/dockerman/overview" >> "$LOGFILE"
 else
-    echo "  [6] quickstart 无该链接或未安装，跳过" >> "$LOGFILE"
+    echo "  [7] quickstart 无该链接或未安装，跳过" >> "$LOGFILE"
 fi
 
 echo "===== 99-fix.sh done =====" >> "$LOGFILE"
