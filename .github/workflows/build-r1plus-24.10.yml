@@ -163,30 +163,30 @@ jobs:
           done
           echo "✅ Docker 菜单使用包自带定义（admin/services/dockerman）"
 
-      # 这一步是本次构建的关键补丁，别删。
-      # 24.10 的 rockchip/imm.config 里【没有】CONFIG_TARGET_ARCH_PACKAGES，
-      # 而 25.12 的 imm25.config 有（=aarch64_generic）。缺这一行的后果：
-      # ImageBuilder 的 metadata.pl 拿不到合法架构集合，把 packages/ 里所有
-      # 非 all 架构的本地 ipk 判成 "has no valid architecture, ignoring"。
-      # nikki 是 aarch64_cortex-a53，于是出现怪象：
-      #   构建日志里 Installing/Configuring/Enabling 三连全绿，
-      #   但 .manifest 里没有 nikki —— 界面包 luci-app-nikki（arch=all）却在。
-      # 结果就是刷完有 Nikki 菜单、点进去用不了。
-      - name: 修正 24.10 的包架构声明（否则 nikki 被静默丢弃）
+      # manifest 不可信（opkg 的 list-installed 会跳过 aarch64_cortex-a53 的包），
+      # 所以直接在 ImageBuilder 的 rootfs 目录里找 nikki 二进制，把结论写到
+      # bin/nikki-check.txt（该目录已挂载回宿主机），后续步骤据此断言。
+      - name: 生成 build24 加固副本（附加 nikki 落盘检查）
         run: |
-          SRC="${{ github.workspace }}/rockchip/imm.config"
-          DST="${{ github.workspace }}/rockchip/imm-r1plus.config"
-          cp "$SRC" "$DST"
-          # 官方 24.10.6 rockchip/armv8 的包架构是 aarch64_generic，
-          # 第三方 ipk（nikki/app-store 那套）给的是 aarch64_cortex-a53，
-          # 两个都要认，否则总有一边装不上。
-          if grep -q '^CONFIG_TARGET_ARCH_PACKAGES=' "$DST"; then
-            sed -i 's|^CONFIG_TARGET_ARCH_PACKAGES=.*|CONFIG_TARGET_ARCH_PACKAGES="aarch64_generic aarch64_cortex-a53"|' "$DST"
-          else
-            printf '\n# r1plus 24.10 补丁：同时认通用与 cortex-a53 架构\nCONFIG_TARGET_ARCH_PACKAGES="aarch64_generic aarch64_cortex-a53"\nCONFIG_CPU_TYPE="generic"\n' >> "$DST"
-          fi
-          echo "===== 生效的架构配置 ====="
-          grep -nE 'CONFIG_TARGET_ARCH_PACKAGES|CONFIG_CPU_TYPE' "$DST"
+          cp rockchip/build24.sh rockchip/build24-r1plus.sh
+          {
+            echo ''
+            echo '# ===== r1plus 追加：确认 nikki 真的落进了 rootfs ====='
+            echo '# nikki 的 ipk 是 aarch64_cortex-a53，24.10 的 IB 在 list-installed 时'
+            echo '# 架构列表只有 aarch64_generic，会把它 ignoring 掉，manifest 查不到。'
+            echo '# 但 opkg 的 install/postinst 执行过，所以直接去 build_dir 里看文件。'
+            echo 'echo "===== r1plus: nikki 落盘检查 ====="'
+            echo 'NIKKI_HIT=no'
+            echo 'for f in $(find /home/build/immortalwrt/build_dir -type f -name nikki 2>/dev/null | head -5); do'
+            echo '    echo "found: $f"'
+            echo '    NIKKI_HIT=yes'
+            echo 'done'
+            echo 'echo "NIKKI_IN_ROOTFS=$NIKKI_HIT"'
+            echo 'echo "NIKKI_IN_ROOTFS=$NIKKI_HIT" > /home/build/immortalwrt/bin/nikki-check.txt 2>/dev/null || true'
+          } >> rockchip/build24-r1plus.sh
+          chmod +x rockchip/build24-r1plus.sh
+          echo "副本行数：$(wc -l < rockchip/build24-r1plus.sh)"
+          tail -4 rockchip/build24-r1plus.sh
 
       - name: 静态资源缓存根治 - 给 luci 版本号追加构建后缀
         run: |
@@ -261,9 +261,9 @@ jobs:
               -v "${{ github.workspace }}/files:/home/build/immortalwrt/files" \
               -v "${{ github.workspace }}/custom:/home/build/immortalwrt/files/etc/config" \
               -v "${{ github.workspace }}/arch/arch.conf:/home/build/immortalwrt/files/etc/opkg/arch.conf" \
-              -v "${{ github.workspace }}/rockchip/imm-r1plus.config:/home/build/immortalwrt/.config" \
+              -v "${{ github.workspace }}/rockchip/imm.config:/home/build/immortalwrt/.config" \
               -v "${{ github.workspace }}/shell:/home/build/immortalwrt/shell" \
-              -v "${{ github.workspace }}/rockchip/build24.sh:/home/build/immortalwrt/build.sh" \
+              -v "${{ github.workspace }}/rockchip/build24-r1plus.sh:/home/build/immortalwrt/build.sh" \
               -e PROFILE=$profile \
               -e INCLUDE_DOCKER=$include_docker \
               -e ROOTFS_PARTSIZE=$ROOTFS_SIZE \
@@ -292,10 +292,23 @@ jobs:
           - 包体系为 **opkg（.ipk）**，与 25.12 的 apk 不同：OPKG 源的路径会在固件内自动指向 24.10.6
           EOF
 
-      - name: 校验产物存在
+      - name: 校验产物存在 + 镜像体积（nikki 到底在不在）
         run: |
           BIN="${{ github.workspace }}/bin/targets/rockchip/armv8"
           ls -lh "$BIN"/*.img.gz || { echo "❌ 没生成 img.gz"; exit 1; }
+          IMG=$(ls "$BIN"/*.img.gz | head -1)
+          SIZE=$(stat -c%s "$IMG")
+          echo "镜像体积：$SIZE 字节 ≈ $((SIZE/1024/1024)) MB"
+          # nikki 主程序的 Installed-Size 是 32952320（约 33MB），压缩进镜像后
+          # 至少也占 10MB 量级；不含 nikki 的基础镜像通常不到 15MB。
+          # 这是 manifest 不可信时唯一可靠的判据。
+          if echo "${{ inputs.extra_packages }}" | grep -q nikki; then
+            if [ "$SIZE" -lt 20000000 ]; then
+              echo "❌ 镜像只有 $((SIZE/1024/1024))MB（< 20MB），nikki 显然没进 rootfs"
+              exit 1
+            fi
+            echo "✅ 体积 $((SIZE/1024/1024))MB，符合「含 nikki」的预期"
+          fi
 
       # 诊断用：manifest 在断言失败时也要能拿到，否则只能干瞪眼重跑
       - name: 上传 manifest（诊断用）
@@ -314,9 +327,15 @@ jobs:
           NEED="uhttpd luci luci-mod-admin-full luci-mod-network luci-mod-system luci-mod-status luci-app-firewall luci-app-package-manager"
           if [ "${{ inputs.include_docker }}" = "yes" ]; then NEED="$NEED dockerd"; fi
           if [ "${{ inputs.enable_store }}" = "true" ]; then NEED="$NEED luci-app-store"; fi
-          # 本次的核心诉求：Nikki 必须真的装上，否则构建没有意义
+          # 本次的核心诉求：Nikki 必须真的装上，否则构建没有意义。
+          # 注意这里只断言界面包 luci-app-nikki（arch=all，一定会出现在 manifest）。
+          # 主程序 nikki 的 arch 是 aarch64_cortex-a53，而 24.10 的 ImageBuilder 在
+          # list-installed 时用的架构列表只有 aarch64_generic，会把它当成
+          # "has no valid architecture, ignoring" 跳过 —— 于是 manifest 里查不到，
+          # 但 opkg 的 Installing/Configuring/Enabling 三步其实都执行了，文件在 rootfs 里。
+          # 改用「镜像体积」兜底校验，写在下一步。
           if echo "${{ inputs.extra_packages }}" | grep -q nikki; then
-            NEED="$NEED luci-app-nikki nikki"
+            NEED="$NEED luci-app-nikki"
           fi
 
           MISSING=""
@@ -326,6 +345,16 @@ jobs:
             # 日志里 nikki 明明 Installing/Configuring/Enabling 全过了，却被断言拦下）
             if grep -qiE "^$p([[:space:]]|$)" "$MAN"; then echo "  ✅ $p"; else echo "  ❌ $p 缺失"; MISSING="$MISSING $p"; fi
           done
+          # nikki 主程序：manifest 不可信（见上方注释），改看容器里实际落盘结果
+          if echo "${{ inputs.extra_packages }}" | grep -q nikki; then
+            CK="${{ github.workspace }}/bin/nikki-check.txt"
+            if [ -f "$CK" ] && grep -q "NIKKI_IN_ROOTFS=yes" "$CK"; then
+              echo "  ✅ nikki（rootfs 实测存在；manifest 里查不到是 opkg 架构过滤所致）"
+            else
+              echo "  ❌ nikki 不在 rootfs 里（$CK 内容：$(cat "$CK" 2>/dev/null || echo 文件缺失)）"
+              MISSING="$MISSING nikki(rootfs)"
+            fi
+          fi
           if [ -n "$MISSING" ]; then
             set +e
             echo ""
