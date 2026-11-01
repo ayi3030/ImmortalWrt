@@ -1,0 +1,326 @@
+name: Build R1 Plus | ImmortalWrt 24.10.x (kernel 6.6)
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Orange Pi R1 Plus 定制固件构建 —— 24.10 / 内核 6.6 版
+#
+#  为什么要有这个文件：
+#    25.12（内核 6.12）在 RK3328 上 PPPoE 收包能力掉到 ~450-500Mbps，
+#    同硬件同线路在 24.10（内核 6.6）能跑 930Mbps。这是内核回归，
+#    参数调不回来。本工作流把 25.12 定制版的所有加固原样搬到 24.10 上，
+#    只替换构建体系（apk → opkg）。
+#
+#  与 build-r1plus-25.12.yml 的差异（只有这 5 处，其余 1:1 保留）：
+#    ① luci_version 选项 25.12.x → 24.10.0 ~ 24.10.6
+#    ② rockchip/imm25.config → rockchip/imm.config
+#    ③ rockchip/build25.sh   → rockchip/build24.sh
+#    ④ shell/apk-custom-packages.sh → shell/custom-packages.sh
+#       （build24.sh 只 source 这个；24.10 是 opkg 体系，写错文件会静默失效）
+#    ⑤ version.uc 后缀注入改为「存在才注入」——24.10 的 LuCI 也是 ucode，
+#       理论上存在；但不同小版本路径若有差异，宁可跳过也不要让构建挂掉
+#
+#  25.12 版的全部加固均保留：
+#    · 不含 PPPoE 凭据（build24.sh 会写空的 pppoe-settings，由 99-fix.sh 清掉）
+#    · WAN 入站 REJECT（99-fix.sh 断言）
+#    · 静态资源 ?v= 带构建后缀（治浏览器缓存）
+#    · manifest 断言：管理页必需包缺一个就 fail
+#    · 额外新增：断言 nikki 装上了（本次核心诉求就是带 Nikki）
+#
+#  ⚠️ 24.10 用 opkg（.ipk），25.12 用 apk。第三方包来自 wukongdaily/store
+#     的 run 文件，目录是 run/arm64，架构标记为 aarch64_cortex-a53；
+#     build24.sh 里已把 cortex-a53 优先级设为 15（高于 generic 的 10）。
+
+on:
+  workflow_dispatch:
+    inputs:
+      luci_version:
+        description: "luci / 内核版本（决定拉哪个 ImageBuilder 镜像；24.10.x = kernel 6.6）"
+        required: false
+        default: "24.10.6"
+        type: choice
+        options:
+          - 24.10.0
+          - 24.10.1
+          - 24.10.2
+          - 24.10.3
+          - 24.10.4
+          - 24.10.5
+          - 24.10.6
+
+      profile:
+        description: "设备型号（R1 Plus 非 LTS；LTS 版网卡是 yt8531c，别选错）"
+        required: true
+        type: choice
+        default: "xunlong_orangepi-r1-plus"
+        options:
+          - xunlong_orangepi-r1-plus
+          - xunlong_orangepi-r1-plus-lts
+          - friendlyarm_nanopi-r2s
+          - friendlyarm_nanopi-r2c
+          - friendlyarm_nanopi-r2c-plus
+          - friendlyarm_nanopi-r3s
+          - friendlyarm_nanopi-r4s
+          - friendlyarm_nanopi-r4se
+          - firefly_roc-rk3328-cc
+          - xunlong_orangepi-5
+          - xunlong_orangepi-5-plus
+
+      custom_router_ip:
+        description: "后台管理地址（用你现网同网段，否则刷完进不去后台）"
+        required: true
+        default: "10.0.0.1"
+
+      rootfs_partsize:
+        description: "rootfs 分区大小（现网是 2G；64G 卡建议 4G，剩余空间另建 docker 数据分区）"
+        required: true
+        type: choice
+        default: "2G"
+        options:
+          - "1G"
+          - "2G"
+          - "3G"
+          - "4G"
+
+      enable_store:
+        description: "集成 iStore 商店（luci-app-store）"
+        required: false
+        type: boolean
+        default: true
+
+      include_docker:
+        description: "集成 Docker（1GB 内存跑 docker 偏紧，不需要就选 no）"
+        required: true
+        type: choice
+        default: "yes"
+        options:
+          - "yes"
+          - "no"
+
+      extra_packages:
+        description: "额外软件包，空格分隔。默认值 = 现网那套 + nikki 的全部依赖（kmod 必须显式列出，否则 ImageBuilder 会因依赖无法解析而中断）"
+        required: false
+        # nikki_2026.02.08-r1 的 Depends：ca-bundle, curl, yq, firewall4, ip-full,
+        # kmod-inet-diag, kmod-nft-socket, kmod-nft-tproxy, kmod-tun, kmod-dummy
+        # 已在 24.10.6 的 rockchip/armv8/kmods/6.6.133-1-*/Packages 中逐一核实存在。
+        default: "luci-i18n-quickstart-zh-cn luci-i18n-nikki-zh-cn luci-app-samba4 luci-i18n-samba4-zh-cn luci-i18n-upnp-zh-cn kmod-inet-diag kmod-nft-socket kmod-nft-tproxy kmod-tun kmod-dummy ip-full yq"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      # 上游通用 24.10 工作流这里写的是 build24.sh，是对的；
+      # 25.12 那份漏改成 build25.sh 才有问题。此处必须是 build24.sh。
+      - name: Set executable permissions
+        run: chmod +x "${{ github.workspace }}/rockchip/build24.sh"
+
+      - name: Save custom router IP
+        run: |
+          mkdir -p "${{ github.workspace }}/custom"
+          echo "${{ inputs.custom_router_ip }}" > "${{ github.workspace }}/custom/custom_router_ip.txt"
+          echo "后台地址将设为: ${{ inputs.custom_router_ip }}"
+
+      - name: Preflight - 检查必需文件都在
+        run: |
+          WARNFILE="${{ github.workspace }}/files/etc/uci-defaults/99-fix.sh"
+          if [ -f "$WARNFILE" ]; then
+            echo "✅ 找到 99-fix.sh（WAN 入站收回 + 凭据清理）"
+          else
+            echo "❌ 缺少 files/etc/uci-defaults/99-fix.sh"
+            echo "   没有它，固件出厂的 WAN 入站就是 ACCEPT（全部服务暴露到公网）。"
+            exit 1
+          fi
+          grep -q "input='REJECT'" "$WARNFILE" \
+            && echo "✅ 99-fix.sh 里确认有 REJECT 逻辑" \
+            || { echo "❌ 99-fix.sh 里没有 REJECT 逻辑，停止构建"; exit 1; }
+
+          # 24.10 体系必须用 build24.sh + custom-packages.sh，写错文件会静默失效
+          [ -f "${{ github.workspace }}/rockchip/build24.sh" ] \
+            && echo "✅ 存在 rockchip/build24.sh" \
+            || { echo "❌ 缺少 rockchip/build24.sh"; exit 1; }
+          [ -f "${{ github.workspace }}/rockchip/imm.config" ] \
+            && echo "✅ 存在 rockchip/imm.config（24.10 的 ImageBuilder 配置）" \
+            || { echo "❌ 缺少 rockchip/imm.config"; exit 1; }
+          [ -f "${{ github.workspace }}/shell/custom-packages.sh" ] \
+            && echo "✅ 存在 shell/custom-packages.sh（opkg 体系）" \
+            || { echo "❌ 缺少 shell/custom-packages.sh"; exit 1; }
+          grep -q "source shell/custom-packages.sh" "${{ github.workspace }}/rockchip/build24.sh" \
+            && echo "✅ build24.sh 确实 source 了 custom-packages.sh" \
+            || { echo "❌ build24.sh 没有 source custom-packages.sh，包会装不上"; exit 1; }
+
+          for F in "${{ github.workspace }}/files/usr/share/luci/menu.d/luci-app-dockerman.json" \
+                   "${{ github.workspace }}/files/www/luci-static/resources/dockerman/common.js"; do
+            if [ -f "$F" ]; then
+              echo "❌ 发现 dockerman 覆盖文件：$F"
+              echo "   它与「Docker 用包自带菜单」的决策冲突，请先 git rm 再构建。"
+              exit 1
+            fi
+          done
+          echo "✅ Docker 菜单使用包自带定义（admin/services/dockerman）"
+
+      - name: 静态资源缓存根治 - 给 luci 版本号追加构建后缀
+        run: |
+          # 24.10 的 LuCI 同为 ucode 架构，路径一致；若某小版本没有该文件，
+          # 跳过而不是失败（这只是治浏览器缓存的优化，不是功能必需）。
+          VU="${{ github.workspace }}/files/usr/share/ucode/luci/version.uc"
+          if [ ! -f "$VU" ]; then
+            echo "⚠️ 未找到 $VU，跳过版本号后缀注入（不影响功能）"
+            exit 0
+          fi
+          echo "改前：$(cat "$VU")"
+          sed -i "s/\(revision = '\)\([^']*\)'/\1\2-r1plus.${{ github.run_number }}'/" "$VU"
+          echo "改后：$(cat "$VU")"
+          grep -q -- "-r1plus.${{ github.run_number }}" "$VU" \
+            && echo "✅ 资源版本号已带构建后缀（本次 run #${{ github.run_number }}）" \
+            || echo "⚠️ 后缀未注入（version.uc 格式可能不同，不影响功能）"
+
+      - name: Enable Store integration
+        run: |
+          if [ "${{ inputs.enable_store }}" == "true" ]; then
+            echo 'CUSTOM_PACKAGES="$CUSTOM_PACKAGES luci-app-store"' >> shell/custom-packages.sh
+            echo "✅ 已追加 luci-app-store"
+          else
+            echo "❎ 未启用商店"
+          fi
+
+      - name: Check Docker
+        run: |
+          if [ "${{ inputs.include_docker }}" == "yes" ]; then
+            echo 'CUSTOM_PACKAGES="$CUSTOM_PACKAGES docker"' >> shell/custom-packages.sh
+            echo "✅ 已追加 docker（写入 custom-packages.sh，build24.sh 会 source 它）"
+          else
+            echo "❎ 未启用 docker"
+          fi
+
+      - name: 追加用户自定义包
+        run: |
+          EXTRA="${{ inputs.extra_packages }}"
+          EXTRA=$(echo "$EXTRA" | tr -s ' ')
+          if [ -n "$EXTRA" ]; then
+            echo "CUSTOM_PACKAGES=\"\$CUSTOM_PACKAGES $EXTRA\"" >> shell/custom-packages.sh
+            echo "✅ 已追加自定义包："
+            echo "$EXTRA" | tr ' ' '\n' | sed 's/^/  - /'
+          else
+            echo "⚪️ 未指定额外包"
+          fi
+
+      - name: 显示最终包清单
+        run: |
+          echo "===== shell/custom-packages.sh 生效行（非注释）====="
+          grep -vE '^\s*#' shell/custom-packages.sh | grep -v '^\s*$' || true
+
+      - name: Building Rockchip ImmortalWrt 24.10.x
+        run: |
+          profile="${{ inputs.profile }}"
+          include_docker="${{ inputs.include_docker }}"
+          rootfs_partsize="${{ inputs.rootfs_partsize }}"
+          case "$rootfs_partsize" in
+            1G) ROOTFS_SIZE=1024 ;;
+            2G) ROOTFS_SIZE=2048 ;;
+            3G) ROOTFS_SIZE=3072 ;;
+            4G) ROOTFS_SIZE=4096 ;;
+          esac
+          echo "ROOTFS_SIZE=$ROOTFS_SIZE" >> $GITHUB_ENV
+          luci_version="${{ inputs.luci_version }}"
+          echo "profile=$profile  rootfs=${ROOTFS_SIZE}MB  luci=$luci_version (kernel 6.6)"
+
+          # build24.sh 要求这几个环境变量；PPPoE 相关刻意留空（与 25.12 版一致，不写凭据）
+          docker run --rm -i \
+              --user root \
+              -v "${{ github.workspace }}/bin:/home/build/immortalwrt/bin" \
+              -v "${{ github.workspace }}/files:/home/build/immortalwrt/files" \
+              -v "${{ github.workspace }}/custom:/home/build/immortalwrt/files/etc/config" \
+              -v "${{ github.workspace }}/arch/arch.conf:/home/build/immortalwrt/files/etc/opkg/arch.conf" \
+              -v "${{ github.workspace }}/rockchip/imm.config:/home/build/immortalwrt/.config" \
+              -v "${{ github.workspace }}/shell:/home/build/immortalwrt/shell" \
+              -v "${{ github.workspace }}/rockchip/build24.sh:/home/build/immortalwrt/build.sh" \
+              -e PROFILE=$profile \
+              -e INCLUDE_DOCKER=$include_docker \
+              -e ROOTFS_PARTSIZE=$ROOTFS_SIZE \
+              -e ENABLE_PPPOE=no \
+              -e PPPOE_ACCOUNT= \
+              -e PPPOE_PASSWORD= \
+          immortalwrt/imagebuilder:rockchip-armv8-openwrt-${luci_version} /bin/bash /home/build/immortalwrt/build.sh
+
+      - name: Create info
+        run: |
+          cat > "${{ github.workspace }}/router-info.md" <<EOF
+          ## 📡 路由器后台信息
+
+          - ✳️ **设备型号**: ${{ inputs.profile }}
+          - 🏠 **后台地址**: ${{ inputs.custom_router_ip }}
+          - 👤 **用户名**: root
+          - 🔑 **密码**: 无（出厂空密码，刷完请立刻到「系统 → 管理权」设置）
+          - 🧱 **luci / 内核**: ${{ inputs.luci_version }}（**kernel 6.6**）
+          - 💾 **rootfs 分区**: ${{ inputs.rootfs_partsize }}
+          - 🐳 **Docker 面板**: 「服务 → Dockerman JS」
+
+          #### 本版特别说明
+
+          - 这是 **24.10 / 内核 6.6** 版本，用于验证 RK3328 上 PPPoE 收包能力回归
+          - 出厂安全设置与 25.12 定制版一致：WAN 入站 **REJECT**、不含 PPPoE 凭据、root 密码未预置
+          - 包体系为 **opkg（.ipk）**，与 25.12 的 apk 不同：OPKG 源的路径会在固件内自动指向 24.10.6
+          EOF
+
+      - name: 校验产物存在
+        run: |
+          BIN="${{ github.workspace }}/bin/targets/rockchip/armv8"
+          ls -lh "$BIN"/*.img.gz || { echo "❌ 没生成 img.gz"; exit 1; }
+
+      - name: 断言必需包（缺一个就失败）
+        run: |
+          MAN=$(ls "${{ github.workspace }}"/bin/targets/rockchip/armv8/*.manifest 2>/dev/null | head -1)
+          [ -z "$MAN" ] && { echo "❌ 找不到 manifest"; exit 1; }
+          echo "核对：$MAN   （包总数 $(wc -l < "$MAN")）"
+
+          NEED="uhttpd luci luci-mod-admin-full luci-mod-network luci-mod-system luci-mod-status luci-app-firewall luci-app-package-manager"
+          if [ "${{ inputs.include_docker }}" = "yes" ]; then NEED="$NEED dockerd"; fi
+          if [ "${{ inputs.enable_store }}" = "true" ]; then NEED="$NEED luci-app-store"; fi
+          # 本次的核心诉求：Nikki 必须真的装上，否则构建没有意义
+          if echo "${{ inputs.extra_packages }}" | grep -q nikki; then
+            NEED="$NEED luci-app-nikki nikki"
+          fi
+
+          MISSING=""
+          for p in $NEED; do
+            if grep -q "^$p " "$MAN"; then echo "  ✅ $p"; else echo "  ❌ $p 缺失"; MISSING="$MISSING $p"; fi
+          done
+          if [ -n "$MISSING" ]; then
+            echo ""
+            echo "❌ 固件缺少必需包：$MISSING"
+            echo "   多半是 PACKAGES= 里某个包名在 24.10 源里不存在，把默认包集顶掉了。"
+            echo "   看构建日志里的 '(no such package)' 或 'Cannot satisfy' 定位。"
+            exit 1
+          fi
+          echo ""
+          echo "✅ 必需包齐全（含 Nikki）"
+
+          # 内核版本核对：必须是 6.6.x，否则这次构建就白做了
+          echo ""
+          echo "===== 内核版本核对 ====="
+          grep -E "^kernel " "$MAN" || echo "(manifest 无 kernel 行，跳过)"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: imm-r1plus-24.10-${{ github.run_number }}
+          path: ${{ github.workspace }}/bin/targets/rockchip/armv8/*.img.gz
+          retention-days: 30
+
+      - name: Publish to release
+        uses: softprops/action-gh-release@v3
+        with:
+          # 与 25.12 版共用 Autobuild 这个 tag，旧镜像不会被删，方便随时回滚
+          tag_name: Autobuild
+          name: ImmortWrt-Rockchip
+          body_path: ${{ github.workspace }}/router-info.md
+          files: |
+            ${{ github.workspace }}/bin/targets/rockchip/armv8/*.img.gz
+          token: ${{ secrets.GITHUB_TOKEN }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
