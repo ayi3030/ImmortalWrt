@@ -272,6 +272,14 @@ jobs:
           BIN="${{ github.workspace }}/bin/targets/rockchip/armv8"
           ls -lh "$BIN"/*.img.gz || { echo "❌ 没生成 img.gz"; exit 1; }
 
+      # 诊断用：manifest 在断言失败时也要能拿到，否则只能干瞪眼重跑
+      - name: 上传 manifest（诊断用）
+        uses: actions/upload-artifact@v4
+        with:
+          name: manifest-diag-${{ github.run_number }}
+          path: ${{ github.workspace }}/bin/targets/rockchip/armv8/*.manifest
+          retention-days: 3
+
       - name: 断言必需包（缺一个就失败）
         run: |
           MAN=$(ls "${{ github.workspace }}"/bin/targets/rockchip/armv8/*.manifest 2>/dev/null | head -1)
@@ -294,15 +302,18 @@ jobs:
             if grep -qiE "^$p([[:space:]]|$)" "$MAN"; then echo "  ✅ $p"; else echo "  ❌ $p 缺失"; MISSING="$MISSING $p"; fi
           done
           if [ -n "$MISSING" ]; then
+            set +e
             echo ""
             echo "❌ 固件缺少必需包：$MISSING"
             echo "   多半是 PACKAGES= 里某个包名在 24.10 源里不存在，把默认包集顶掉了。"
             echo "   看构建日志里的 '(no such package)' 或 'Cannot satisfy' 定位。"
             echo ""
             echo "---- manifest 中含 nikki 的行（排查格式用）----"
-            grep -i nikki "$MAN" | head -10 || echo "(一行都没有)"
-            echo "---- manifest 前 3 行（看分隔符）----"
+            grep -i nikki "$MAN" | head -10
+            echo "---- manifest 前 3 行（cat -A 看分隔符）----"
             head -3 "$MAN" | cat -A | cut -c1-120
+            echo "---- 版本含 2026.02.08 的行 ----"
+            grep -n "2026.02.08" "$MAN" | head -5
             exit 1
           fi
           echo ""
