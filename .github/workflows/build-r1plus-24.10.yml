@@ -163,6 +163,31 @@ jobs:
           done
           echo "✅ Docker 菜单使用包自带定义（admin/services/dockerman）"
 
+      # 这一步是本次构建的关键补丁，别删。
+      # 24.10 的 rockchip/imm.config 里【没有】CONFIG_TARGET_ARCH_PACKAGES，
+      # 而 25.12 的 imm25.config 有（=aarch64_generic）。缺这一行的后果：
+      # ImageBuilder 的 metadata.pl 拿不到合法架构集合，把 packages/ 里所有
+      # 非 all 架构的本地 ipk 判成 "has no valid architecture, ignoring"。
+      # nikki 是 aarch64_cortex-a53，于是出现怪象：
+      #   构建日志里 Installing/Configuring/Enabling 三连全绿，
+      #   但 .manifest 里没有 nikki —— 界面包 luci-app-nikki（arch=all）却在。
+      # 结果就是刷完有 Nikki 菜单、点进去用不了。
+      - name: 修正 24.10 的包架构声明（否则 nikki 被静默丢弃）
+        run: |
+          SRC="${{ github.workspace }}/rockchip/imm.config"
+          DST="${{ github.workspace }}/rockchip/imm-r1plus.config"
+          cp "$SRC" "$DST"
+          # 官方 24.10.6 rockchip/armv8 的包架构是 aarch64_generic，
+          # 第三方 ipk（nikki/app-store 那套）给的是 aarch64_cortex-a53，
+          # 两个都要认，否则总有一边装不上。
+          if grep -q '^CONFIG_TARGET_ARCH_PACKAGES=' "$DST"; then
+            sed -i 's|^CONFIG_TARGET_ARCH_PACKAGES=.*|CONFIG_TARGET_ARCH_PACKAGES="aarch64_generic aarch64_cortex-a53"|' "$DST"
+          else
+            printf '\n# r1plus 24.10 补丁：同时认通用与 cortex-a53 架构\nCONFIG_TARGET_ARCH_PACKAGES="aarch64_generic aarch64_cortex-a53"\nCONFIG_CPU_TYPE="generic"\n' >> "$DST"
+          fi
+          echo "===== 生效的架构配置 ====="
+          grep -nE 'CONFIG_TARGET_ARCH_PACKAGES|CONFIG_CPU_TYPE' "$DST"
+
       - name: 静态资源缓存根治 - 给 luci 版本号追加构建后缀
         run: |
           # 24.10 的 LuCI 同为 ucode 架构，路径一致；若某小版本没有该文件，
@@ -236,7 +261,7 @@ jobs:
               -v "${{ github.workspace }}/files:/home/build/immortalwrt/files" \
               -v "${{ github.workspace }}/custom:/home/build/immortalwrt/files/etc/config" \
               -v "${{ github.workspace }}/arch/arch.conf:/home/build/immortalwrt/files/etc/opkg/arch.conf" \
-              -v "${{ github.workspace }}/rockchip/imm.config:/home/build/immortalwrt/.config" \
+              -v "${{ github.workspace }}/rockchip/imm-r1plus.config:/home/build/immortalwrt/.config" \
               -v "${{ github.workspace }}/shell:/home/build/immortalwrt/shell" \
               -v "${{ github.workspace }}/rockchip/build24.sh:/home/build/immortalwrt/build.sh" \
               -e PROFILE=$profile \
