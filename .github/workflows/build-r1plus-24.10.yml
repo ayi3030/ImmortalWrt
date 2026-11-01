@@ -288,13 +288,21 @@ jobs:
 
           MISSING=""
           for p in $NEED; do
-            if grep -q "^$p " "$MAN"; then echo "  ✅ $p"; else echo "  ❌ $p 缺失"; MISSING="$MISSING $p"; fi
+            # manifest 的行分隔在不同小版本里有 "pkg - ver" 和 "pkg<TAB>ver" 两种，
+            # 只认空格会误判成缺包（2026-11-01 首次构建就被这条坑了一次：
+            # 日志里 nikki 明明 Installing/Configuring/Enabling 全过了，却被断言拦下）
+            if grep -qiE "^$p([[:space:]]|$)" "$MAN"; then echo "  ✅ $p"; else echo "  ❌ $p 缺失"; MISSING="$MISSING $p"; fi
           done
           if [ -n "$MISSING" ]; then
             echo ""
             echo "❌ 固件缺少必需包：$MISSING"
             echo "   多半是 PACKAGES= 里某个包名在 24.10 源里不存在，把默认包集顶掉了。"
             echo "   看构建日志里的 '(no such package)' 或 'Cannot satisfy' 定位。"
+            echo ""
+            echo "---- manifest 中含 nikki 的行（排查格式用）----"
+            grep -i nikki "$MAN" | head -10 || echo "(一行都没有)"
+            echo "---- manifest 前 3 行（看分隔符）----"
+            head -3 "$MAN" | cat -A | cut -c1-120
             exit 1
           fi
           echo ""
